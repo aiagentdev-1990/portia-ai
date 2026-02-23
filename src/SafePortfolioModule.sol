@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 interface ISafe {
     function isOwner(address owner) external view returns (bool);
+    function isModuleEnabled(address module) external view returns (bool);
     function execTransactionFromModule(
         address to,
         uint256 value,
@@ -31,8 +32,10 @@ contract SafePortfolioModule is ReentrancyGuard {
     struct SafeConfig {
         mapping(address => RateLimit) rateLimits;                         // Rate limits per token (address(0) = ETH)
         mapping(address => mapping(bytes4 => bool)) allowedActions;       // Whitelist: target -> functionSelector -> allowed
-        mapping(address => bool) allFunctionsAllowedForTarget;            // If true, all functions allowed for target
+        mapping(address => bool) whitelistedActions;                      // If true, all functions allowed for target
         bool allTargetsAllowed;                                           // If true, all targets and functions are allowed
+        address[] tokensWithRateLimits;                                   // Array of tokens that have rate limits configured
+        mapping(address => bool) hasRateLimit;                            // Quick lookup for tokens with rate limits
     }
 
     // ============ Storage State ============
@@ -104,6 +107,7 @@ contract SafePortfolioModule is ReentrancyGuard {
     error InvalidRateLimit();
     error NotSafeOwner();
     error NotTrustedRelayer();
+    error ModuleNotEnabled();
     error ActionNotAllowed();
     error RateLimitExceeded();
     error ModuleExecutionFailed();
@@ -113,6 +117,9 @@ contract SafePortfolioModule is ReentrancyGuard {
      * @param safe Address of the Safe to check ownership for
      */
     modifier onlySafeOwner(address safe) {
+        if (safe.code.length == 0) {
+            revert InvalidSafe();
+        }
         if (!ISafe(safe).isOwner(msg.sender)) {
             revert NotSafeOwner();
         }
@@ -173,7 +180,7 @@ contract SafePortfolioModule is ReentrancyGuard {
     ) external view returns (bool) {
         SafeConfig storage config = s_safeConfigs[safe];
         return config.allTargetsAllowed ||
-               config.allFunctionsAllowedForTarget[target] ||
+               config.whitelistedActions[target] ||
                config.allowedActions[target][functionSelector];
     }
 
@@ -206,7 +213,15 @@ contract SafePortfolioModule is ReentrancyGuard {
             revert InvalidRateLimit();
         }
 
-        s_safeConfigs[safe].rateLimits[token] = RateLimit({
+        SafeConfig storage config = s_safeConfigs[safe];
+
+        // Add token to tracking array if not already present
+        if (!config.hasRateLimit[token]) {
+            config.tokensWithRateLimits.push(token);
+            config.hasRateLimit[token] = true;
+        }
+
+        config.rateLimits[token] = RateLimit({
             maxAmount: maxAmount,
             windowDuration: windowDuration,
             lastResetTime: block.timestamp,
@@ -257,7 +272,7 @@ contract SafePortfolioModule is ReentrancyGuard {
         address target,
         bool allowed
     ) external onlySafeOwner(safe) {
-        s_safeConfigs[safe].allFunctionsAllowedForTarget[target] = allowed;
+        s_safeConfigs[safe].whitelistedActions[target] = allowed;
         emit AllFunctionsToggledForTarget(safe, target, allowed, msg.sender);
     }
 
@@ -279,7 +294,7 @@ contract SafePortfolioModule is ReentrancyGuard {
     function resetRateLimitWindow(address safe, address token) external onlySafeOwner(safe) {
         RateLimit storage limit = s_safeConfigs[safe].rateLimits[token];
         limit.lastResetTime = block.timestamp;
-        limit.spentInWindow = 0;
+        delete limit.spentInWindow;
 
         emit RateLimitConsumed(safe, token, 0, 0, limit.maxAmount);
     }
@@ -314,6 +329,16 @@ contract SafePortfolioModule is ReentrancyGuard {
         uint256 value,
         bytes calldata data
     ) external onlyTrustedRelayer nonReentrant {
+        // Verify safe is a contract
+        if (safe.code.length == 0) {
+            revert InvalidSafe();
+        }
+
+        // Verify this module is enabled on the Safe
+        if (!ISafe(safe).isModuleEnabled(address(this))) {
+            revert ModuleNotEnabled();
+        }
+
         SafeConfig storage config = s_safeConfigs[safe];
 
         // Extract function selector from data (if data exists)
@@ -324,15 +349,15 @@ contract SafePortfolioModule is ReentrancyGuard {
 
         // Check if action (target + function) is allowed
         bool actionAllowed = config.allTargetsAllowed ||
-                             config.allFunctionsAllowedForTarget[to] ||
+                             config.whitelistedActions[to] ||
                              (data.length >= 4 && config.allowedActions[to][functionSelector]);
 
         if (!actionAllowed) {
             revert ActionNotAllowed();
         }
 
-        // Check and update rate limits
-        _checkAndUpdateRateLimit(safe, to, value, data);
+        // Snapshot balances before execution
+        uint256[] memory balancesBefore = _snapshotBalances(safe, config);
 
         // Execute transaction from module
         bool success = ISafe(safe).execTransactionFromModule(
@@ -345,6 +370,9 @@ contract SafePortfolioModule is ReentrancyGuard {
         if (!success) {
             revert ModuleExecutionFailed();
         }
+
+        // Check and update rate limits based on balance changes
+        _checkAndUpdateRateLimits(safe, config, balancesBefore);
 
         emit ExecutionSuccess(safe, to, value, data);
     }
@@ -402,7 +430,7 @@ contract SafePortfolioModule is ReentrancyGuard {
 
         uint256 windowEnd = limit.lastResetTime + limit.windowDuration;
         if (block.timestamp >= windowEnd) {
-            timeUntilReset = 0; // Window already expired
+            delete timeUntilReset; // Window already expired
         } else {
             timeUntilReset = windowEnd - block.timestamp;
         }
@@ -411,43 +439,60 @@ contract SafePortfolioModule is ReentrancyGuard {
     // ============ Internal Functions ============
 
     /**
-     * @notice Check if the transaction respects rate limits and update spent amounts
+     * @notice Snapshot balances of all tokens with rate limits for a Safe
      * @param safe Address of the Safe
-     * @param to Destination address
-     * @param value ETH value to send
-     * @param data Transaction data
+     * @param config SafeConfig storage reference
+     * @return balances Array of balances before transaction
      */
-    function _checkAndUpdateRateLimit(
+    function _snapshotBalances(
         address safe,
-        address to,
-        uint256 value,
-        bytes calldata data
-    ) internal {
-        // Handle ETH transfers
-        if (value > 0) {
-            _consumeRateLimit(safe, address(0), value);
+        SafeConfig storage config
+    ) internal view returns (uint256[] memory balances) {
+        uint256 tokenCount = config.tokensWithRateLimits.length;
+        balances = new uint256[](tokenCount);
+
+        for (uint256 i = 0; i < tokenCount; i++) {
+            address token = config.tokensWithRateLimits[i];
+            if (token == address(0)) {
+                // ETH balance
+                balances[i] = safe.balance;
+            } else {
+                // ERC20 balance
+                balances[i] = IERC20(token).balanceOf(safe);
+            }
         }
+    }
 
-        // Handle ERC20 transfers
-        if (data.length >= 68) {
-            bytes4 selector = bytes4(data[:4]);
+    /**
+     * @notice Check if balance changes respect rate limits and update spent amounts
+     * @param safe Address of the Safe
+     * @param config SafeConfig storage reference
+     * @param balancesBefore Array of balances before transaction
+     */
+    function _checkAndUpdateRateLimits(
+        address safe,
+        SafeConfig storage config,
+        uint256[] memory balancesBefore
+    ) internal {
+        uint256 tokenCount = config.tokensWithRateLimits.length;
 
-            // Check for ERC20 transfer or transferFrom
-            if (selector == IERC20.transfer.selector ||
-                selector == IERC20.transferFrom.selector) {
+        for (uint256 i = 0; i < tokenCount; i++) {
+            address token = config.tokensWithRateLimits[i];
+            uint256 balanceBefore = balancesBefore[i];
+            uint256 balanceAfter;
 
-                address token = to;
-                uint256 amount;
+            if (token == address(0)) {
+                // ETH balance
+                balanceAfter = safe.balance;
+            } else {
+                // ERC20 balance
+                balanceAfter = IERC20(token).balanceOf(safe);
+            }
 
-                if (selector == IERC20.transfer.selector) {
-                    // transfer(address to, uint256 amount)
-                    (, amount) = abi.decode(data[4:], (address, uint256));
-                } else {
-                    // transferFrom(address from, address to, uint256 amount)
-                    (,, amount) = abi.decode(data[4:], (address, address, uint256));
-                }
-
-                _consumeRateLimit(safe, token, amount);
+            // Check if balance decreased (tokens were spent)
+            if (balanceAfter < balanceBefore) {
+                uint256 spent = balanceBefore - balanceAfter;
+                _consumeRateLimit(safe, token, spent);
             }
         }
     }
@@ -469,7 +514,7 @@ contract SafePortfolioModule is ReentrancyGuard {
         // Check if we need to reset the window
         if (block.timestamp >= limit.lastResetTime + limit.windowDuration) {
             limit.lastResetTime = block.timestamp;
-            limit.spentInWindow = 0;
+            delete limit.spentInWindow;
         }
 
         // Check if adding this amount would exceed the limit
