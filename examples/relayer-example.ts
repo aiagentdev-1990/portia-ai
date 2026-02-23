@@ -17,15 +17,16 @@ const SAFE_PORTFOLIO_MODULE_ABI = [
   // Getter functions
   'function getTrustedRelayer() external view returns (address)',
   'function areAllTargetsAllowed(address safe) external view returns (bool)',
-  'function isTargetAllowed(address safe, address target) external view returns (bool)',
+  'function isActionAllowed(address safe, address target, bytes4 functionSelector) external view returns (bool)',
   'function getRateLimit(address safe, address token) external view returns (tuple(uint256 maxAmount, uint256 windowDuration, uint256 lastResetTime, uint256 spentInWindow))',
   'function getRemainingInWindow(address safe, address token) external view returns (uint256)',
   'function getRateLimitInfo(address safe, address token) external view returns (uint256 maxAmount, uint256 windowDuration, uint256 lastResetTime, uint256 spentInWindow, uint256 timeUntilReset)',
 
   // Safe owner functions
   'function setRateLimit(address safe, address token, uint256 maxAmount, uint256 windowDuration) external',
-  'function allowTarget(address safe, address target) external',
-  'function disallowTarget(address safe, address target) external',
+  'function allowAction(address safe, address target, bytes4 functionSelector) external',
+  'function disallowAction(address safe, address target, bytes4 functionSelector) external',
+  'function setAllFunctionsAllowedForTarget(address safe, address target, bool allowed) external',
   'function setAllTargetsAllowed(address safe, bool allowed) external',
   'function resetRateLimitWindow(address safe, address token) external',
 
@@ -52,17 +53,27 @@ async function setupSafeConfiguration() {
     ownerWallet
   );
 
-  // 1. Configure allowed targets
+  // 1. Configure allowed actions (target + function selector)
   const AAVE_POOL = '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2';
   const UNISWAP_ROUTER = '0xE592427A0AEce92De3Edee1F18E0157C05861564';
 
-  console.log('Allowing Aave and Uniswap as targets...');
-  const allowAaveTx = await moduleContract.allowTarget(SAFE_ADDRESS, AAVE_POOL);
-  await allowAaveTx.wait();
+  // Allow specific Aave functions
+  const aaveDepositSelector = ethers.id('deposit(address,uint256,address,uint16)').slice(0, 10);
+  const aaveWithdrawSelector = ethers.id('withdraw(address,uint256,address)').slice(0, 10);
 
-  const allowUniswapTx = await moduleContract.allowTarget(SAFE_ADDRESS, UNISWAP_ROUTER);
-  await allowUniswapTx.wait();
-  console.log('Targets configured!');
+  console.log('Allowing Aave deposit and withdraw functions...');
+  let tx = await moduleContract.allowAction(SAFE_ADDRESS, AAVE_POOL, aaveDepositSelector);
+  await tx.wait();
+
+  tx = await moduleContract.allowAction(SAFE_ADDRESS, AAVE_POOL, aaveWithdrawSelector);
+  await tx.wait();
+  console.log('Aave actions configured!');
+
+  // Allow all functions for Uniswap Router
+  console.log('Allowing all Uniswap Router functions...');
+  tx = await moduleContract.setAllFunctionsAllowedForTarget(SAFE_ADDRESS, UNISWAP_ROUTER, true);
+  await tx.wait();
+  console.log('Uniswap Router configured!');
 
   // 2. Set rate limits
   const USDC_ADDRESS = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
@@ -259,9 +270,9 @@ async function manageMultipleSafes() {
     relayerWallet
   );
 
-  // Two different Safes with different configurations
-  const SAFE_A = '0x...'; // Conservative Safe
-  const SAFE_B = '0x...'; // Aggressive Safe
+  // Two different Safes with different allowed actions
+  const SAFE_A = '0x...'; // Conservative Safe - only Aave deposit allowed
+  const SAFE_B = '0x...'; // Aggressive Safe - all Uniswap functions allowed
 
   const AAVE_POOL = '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2';
   const USDC_ADDRESS = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
@@ -276,21 +287,25 @@ async function manageMultipleSafes() {
   const depositData = aavePoolInterface.encodeFunctionData('deposit', [
     USDC_ADDRESS,
     depositAmount,
-    SAFE_A, // Will be overridden per Safe
+    SAFE_A,
     0,
   ]);
 
+  // Check if action is allowed for Safe A
+  const depositSelector = ethers.id('deposit(address,uint256,address,uint16)').slice(0, 10);
+  const isAllowedA = await moduleContract.isActionAllowed(SAFE_A, AAVE_POOL, depositSelector);
+  console.log(`Aave deposit allowed for Safe A: ${isAllowedA}`);
+
   // Execute from Safe A
-  console.log('Executing from Safe A (conservative limits)...');
+  console.log('Executing from Safe A (only deposit allowed)...');
   const txA = await moduleContract.execute(SAFE_A, AAVE_POOL, 0, depositData);
   await txA.wait();
   console.log('Safe A transaction confirmed!');
 
-  // Execute from Safe B
-  console.log('Executing from Safe B (aggressive limits)...');
-  const txB = await moduleContract.execute(SAFE_B, AAVE_POOL, 0, depositData);
-  await txB.wait();
-  console.log('Safe B transaction confirmed!');
+  // Execute from Safe B (would fail if action not allowed)
+  console.log('Executing from Safe B (all Uniswap allowed)...');
+  // Safe B configured for Uniswap, not Aave - this would revert
+  // const txB = await moduleContract.execute(SAFE_B, AAVE_POOL, 0, depositData);
 }
 
 /**

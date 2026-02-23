@@ -29,9 +29,10 @@ contract SafePortfolioModule is ReentrancyGuard {
     }
 
     struct SafeConfig {
-        mapping(address => RateLimit) rateLimits;          // Rate limits per token (address(0) = ETH)
-        mapping(address => bool) allowedTargets;           // Whitelist of allowed target addresses
-        bool allTargetsAllowed;                            // If true, all targets are allowed
+        mapping(address => RateLimit) rateLimits;                         // Rate limits per token (address(0) = ETH)
+        mapping(address => mapping(bytes4 => bool)) allowedActions;       // Whitelist: target -> functionSelector -> allowed
+        mapping(address => bool) allFunctionsAllowedForTarget;            // If true, all functions allowed for target
+        bool allTargetsAllowed;                                           // If true, all targets and functions are allowed
     }
 
     // ============ Storage State ============
@@ -65,16 +66,25 @@ contract SafePortfolioModule is ReentrancyGuard {
         uint256 remainingInWindow
     );
 
-    event TargetAllowed(
+    event ActionAllowed(
         address indexed safe,
         address indexed target,
-        address indexed allowedBy
+        bytes4 indexed functionSelector,
+        address allowedBy
     );
 
-    event TargetDisallowed(
+    event ActionDisallowed(
         address indexed safe,
         address indexed target,
-        address indexed disallowedBy
+        bytes4 indexed functionSelector,
+        address disallowedBy
+    );
+
+    event AllFunctionsToggledForTarget(
+        address indexed safe,
+        address indexed target,
+        bool allowed,
+        address indexed toggledBy
     );
 
     event AllTargetsToggled(
@@ -94,7 +104,7 @@ contract SafePortfolioModule is ReentrancyGuard {
     error InvalidRateLimit();
     error NotSafeOwner();
     error NotTrustedRelayer();
-    error TargetNotAllowed();
+    error ActionNotAllowed();
     error RateLimitExceeded();
     error ModuleExecutionFailed();
 
@@ -150,14 +160,21 @@ contract SafePortfolioModule is ReentrancyGuard {
     }
 
     /**
-     * @notice Check if a target is allowed for a Safe
+     * @notice Check if an action (target + function) is allowed for a Safe
      * @param safe Address of the Safe
-     * @param target Address of the target
-     * @return Whether the target is allowed
+     * @param target Address of the target contract
+     * @param functionSelector Function selector to check
+     * @return Whether the action is allowed
      */
-    function isTargetAllowed(address safe, address target) external view returns (bool) {
+    function isActionAllowed(
+        address safe,
+        address target,
+        bytes4 functionSelector
+    ) external view returns (bool) {
         SafeConfig storage config = s_safeConfigs[safe];
-        return config.allTargetsAllowed || config.allowedTargets[target];
+        return config.allTargetsAllowed ||
+               config.allFunctionsAllowedForTarget[target] ||
+               config.allowedActions[target][functionSelector];
     }
 
     /**
@@ -200,23 +217,48 @@ contract SafePortfolioModule is ReentrancyGuard {
     }
 
     /**
-     * @notice Allow a target address for a Safe
+     * @notice Allow a specific action (target + function) for a Safe
      * @param safe Address of the Safe
-     * @param target Address to allow
+     * @param target Target contract address
+     * @param functionSelector Function selector (e.g., bytes4(keccak256("transfer(address,uint256)")))
      */
-    function allowTarget(address safe, address target) external onlySafeOwner(safe) {
-        s_safeConfigs[safe].allowedTargets[target] = true;
-        emit TargetAllowed(safe, target, msg.sender);
+    function allowAction(
+        address safe,
+        address target,
+        bytes4 functionSelector
+    ) external onlySafeOwner(safe) {
+        s_safeConfigs[safe].allowedActions[target][functionSelector] = true;
+        emit ActionAllowed(safe, target, functionSelector, msg.sender);
     }
 
     /**
-     * @notice Disallow a target address for a Safe
+     * @notice Disallow a specific action (target + function) for a Safe
      * @param safe Address of the Safe
-     * @param target Address to disallow
+     * @param target Target contract address
+     * @param functionSelector Function selector
      */
-    function disallowTarget(address safe, address target) external onlySafeOwner(safe) {
-        s_safeConfigs[safe].allowedTargets[target] = false;
-        emit TargetDisallowed(safe, target, msg.sender);
+    function disallowAction(
+        address safe,
+        address target,
+        bytes4 functionSelector
+    ) external onlySafeOwner(safe) {
+        s_safeConfigs[safe].allowedActions[target][functionSelector] = false;
+        emit ActionDisallowed(safe, target, functionSelector, msg.sender);
+    }
+
+    /**
+     * @notice Allow all functions for a specific target contract
+     * @param safe Address of the Safe
+     * @param target Target contract address
+     * @param allowed Whether to allow all functions
+     */
+    function setAllFunctionsAllowedForTarget(
+        address safe,
+        address target,
+        bool allowed
+    ) external onlySafeOwner(safe) {
+        s_safeConfigs[safe].allFunctionsAllowedForTarget[target] = allowed;
+        emit AllFunctionsToggledForTarget(safe, target, allowed, msg.sender);
     }
 
     /**
@@ -272,10 +314,21 @@ contract SafePortfolioModule is ReentrancyGuard {
         uint256 value,
         bytes calldata data
     ) external onlyTrustedRelayer nonReentrant {
-        // Check target is allowed
         SafeConfig storage config = s_safeConfigs[safe];
-        if (!config.allTargetsAllowed && !config.allowedTargets[to]) {
-            revert TargetNotAllowed();
+
+        // Extract function selector from data (if data exists)
+        bytes4 functionSelector;
+        if (data.length >= 4) {
+            functionSelector = bytes4(data[:4]);
+        }
+
+        // Check if action (target + function) is allowed
+        bool actionAllowed = config.allTargetsAllowed ||
+                             config.allFunctionsAllowedForTarget[to] ||
+                             (data.length >= 4 && config.allowedActions[to][functionSelector]);
+
+        if (!actionAllowed) {
+            revert ActionNotAllowed();
         }
 
         // Check and update rate limits
