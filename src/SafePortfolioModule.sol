@@ -17,7 +17,7 @@ interface ISafe {
 /**
  * @title SafePortfolioModule
  * @notice A Safe module that allows a trusted relayer to execute transactions
- *         on behalf of a Safe with enforced rate limits.
+ *         on behalf of multiple Safes with per-Safe configuration and enforced rate limits.
  */
 contract SafePortfolioModule is ReentrancyGuard {
     // Structs
@@ -28,25 +28,29 @@ contract SafePortfolioModule is ReentrancyGuard {
         uint256 spentInWindow;  // Amount spent in current window
     }
 
-    // ============ Immutable State ============
-    /// @dev Address of the Safe contract this module is attached to
-    address private immutable i_safe;
+    struct SafeConfig {
+        mapping(address => RateLimit) rateLimits;          // Rate limits per token (address(0) = ETH)
+        mapping(address => bool) allowedTargets;           // Whitelist of allowed target addresses
+        bool allTargetsAllowed;                            // If true, all targets are allowed
+    }
 
     // ============ Storage State ============
     /// @dev Address of the trusted relayer authorized to execute transactions
     address private s_trustedRelayer;
 
-    /// @dev Rate limits per token (address(0) = ETH)
-    mapping(address => RateLimit) private s_rateLimits;
+    /// @dev Configuration per Safe address
+    mapping(address => SafeConfig) private s_safeConfigs;
 
     // Events
     event ExecutionSuccess(
+        address indexed safe,
         address indexed to,
         uint256 value,
         bytes data
     );
 
     event RateLimitSet(
+        address indexed safe,
         address indexed token,
         uint256 maxAmount,
         uint256 windowDuration,
@@ -54,10 +58,29 @@ contract SafePortfolioModule is ReentrancyGuard {
     );
 
     event RateLimitConsumed(
+        address indexed safe,
         address indexed token,
         uint256 amount,
         uint256 spentInWindow,
         uint256 remainingInWindow
+    );
+
+    event TargetAllowed(
+        address indexed safe,
+        address indexed target,
+        address indexed allowedBy
+    );
+
+    event TargetDisallowed(
+        address indexed safe,
+        address indexed target,
+        address indexed disallowedBy
+    );
+
+    event AllTargetsToggled(
+        address indexed safe,
+        bool allowed,
+        address indexed toggledBy
     );
 
     event RelayerUpdated(
@@ -71,14 +94,16 @@ contract SafePortfolioModule is ReentrancyGuard {
     error InvalidRateLimit();
     error NotSafeOwner();
     error NotTrustedRelayer();
+    error TargetNotAllowed();
     error RateLimitExceeded();
     error ModuleExecutionFailed();
 
     /**
      * @notice Modifier to ensure only Safe owners can call certain functions
+     * @param safe Address of the Safe to check ownership for
      */
-    modifier onlySafeOwner() {
-        if (!ISafe(i_safe).isOwner(msg.sender)) {
+    modifier onlySafeOwner(address safe) {
+        if (!ISafe(safe).isOwner(msg.sender)) {
             revert NotSafeOwner();
         }
         _;
@@ -96,29 +121,16 @@ contract SafePortfolioModule is ReentrancyGuard {
 
     /**
      * @notice Constructor
-     * @param _safe Address of the Safe contract
      * @param _trustedRelayer Address of the trusted relayer
      */
-    constructor(address _safe, address _trustedRelayer) {
-        if (_safe == address(0)) {
-            revert InvalidSafe();
-        }
+    constructor(address _trustedRelayer) {
         if (_trustedRelayer == address(0)) {
             revert InvalidRelayer();
         }
-        i_safe = _safe;
         s_trustedRelayer = _trustedRelayer;
     }
 
     // ============ Getter Functions ============
-
-    /**
-     * @notice Get the Safe contract address
-     * @return Address of the Safe contract
-     */
-    function getSafe() external view returns (address) {
-        return i_safe;
-    }
 
     /**
      * @notice Get the trusted relayer address
@@ -129,46 +141,114 @@ contract SafePortfolioModule is ReentrancyGuard {
     }
 
     /**
-     * @notice Get the rate limit for a specific token
+     * @notice Check if all targets are allowed for a Safe
+     * @param safe Address of the Safe
+     * @return Whether all targets are allowed
+     */
+    function areAllTargetsAllowed(address safe) external view returns (bool) {
+        return s_safeConfigs[safe].allTargetsAllowed;
+    }
+
+    /**
+     * @notice Check if a target is allowed for a Safe
+     * @param safe Address of the Safe
+     * @param target Address of the target
+     * @return Whether the target is allowed
+     */
+    function isTargetAllowed(address safe, address target) external view returns (bool) {
+        SafeConfig storage config = s_safeConfigs[safe];
+        return config.allTargetsAllowed || config.allowedTargets[target];
+    }
+
+    /**
+     * @notice Get the rate limit for a specific token on a Safe
+     * @param safe Address of the Safe
      * @param token Token address (address(0) for ETH)
      * @return rateLimit The RateLimit struct for the token
      */
-    function getRateLimit(address token) external view returns (RateLimit memory) {
-        return s_rateLimits[token];
+    function getRateLimit(address safe, address token) external view returns (RateLimit memory) {
+        return s_safeConfigs[safe].rateLimits[token];
     }
 
-    // ============ Owner Functions ============
+    // ============ Safe Owner Functions ============
 
     /**
-     * @notice Set rate limit for a specific token
+     * @notice Set rate limit for a specific token on a Safe
+     * @param safe Address of the Safe
      * @param token Token address (address(0) for ETH)
      * @param maxAmount Maximum amount that can be spent in the time window
      * @param windowDuration Duration of the time window in seconds
      */
     function setRateLimit(
+        address safe,
         address token,
         uint256 maxAmount,
         uint256 windowDuration
-    ) external onlySafeOwner {
+    ) external onlySafeOwner(safe) {
         if (windowDuration == 0) {
             revert InvalidRateLimit();
         }
 
-        s_rateLimits[token] = RateLimit({
+        s_safeConfigs[safe].rateLimits[token] = RateLimit({
             maxAmount: maxAmount,
             windowDuration: windowDuration,
             lastResetTime: block.timestamp,
             spentInWindow: 0
         });
 
-        emit RateLimitSet(token, maxAmount, windowDuration, msg.sender);
+        emit RateLimitSet(safe, token, maxAmount, windowDuration, msg.sender);
     }
 
     /**
-     * @notice Update the trusted relayer address
+     * @notice Allow a target address for a Safe
+     * @param safe Address of the Safe
+     * @param target Address to allow
+     */
+    function allowTarget(address safe, address target) external onlySafeOwner(safe) {
+        s_safeConfigs[safe].allowedTargets[target] = true;
+        emit TargetAllowed(safe, target, msg.sender);
+    }
+
+    /**
+     * @notice Disallow a target address for a Safe
+     * @param safe Address of the Safe
+     * @param target Address to disallow
+     */
+    function disallowTarget(address safe, address target) external onlySafeOwner(safe) {
+        s_safeConfigs[safe].allowedTargets[target] = false;
+        emit TargetDisallowed(safe, target, msg.sender);
+    }
+
+    /**
+     * @notice Toggle whether all targets are allowed for a Safe
+     * @param safe Address of the Safe
+     * @param allowed Whether to allow all targets
+     */
+    function setAllTargetsAllowed(address safe, bool allowed) external onlySafeOwner(safe) {
+        s_safeConfigs[safe].allTargetsAllowed = allowed;
+        emit AllTargetsToggled(safe, allowed, msg.sender);
+    }
+
+    /**
+     * @notice Reset rate limit window for a token on a Safe (owner only)
+     * @param safe Address of the Safe
+     * @param token Token address (address(0) for ETH)
+     */
+    function resetRateLimitWindow(address safe, address token) external onlySafeOwner(safe) {
+        RateLimit storage limit = s_safeConfigs[safe].rateLimits[token];
+        limit.lastResetTime = block.timestamp;
+        limit.spentInWindow = 0;
+
+        emit RateLimitConsumed(safe, token, 0, 0, limit.maxAmount);
+    }
+
+    // ============ Module Owner Functions ============
+
+    /**
+     * @notice Update the trusted relayer address (only callable by current relayer)
      * @param newRelayer New trusted relayer address
      */
-    function setTrustedRelayer(address newRelayer) external onlySafeOwner {
+    function setTrustedRelayer(address newRelayer) external onlyTrustedRelayer {
         if (newRelayer == address(0)) {
             revert InvalidRelayer();
         }
@@ -177,36 +257,32 @@ contract SafePortfolioModule is ReentrancyGuard {
         emit RelayerUpdated(oldRelayer, newRelayer);
     }
 
-    /**
-     * @notice Reset rate limit window for a token (owner only)
-     * @param token Token address (address(0) for ETH)
-     */
-    function resetRateLimitWindow(address token) external onlySafeOwner {
-        RateLimit storage limit = s_rateLimits[token];
-        limit.lastResetTime = block.timestamp;
-        limit.spentInWindow = 0;
-
-        emit RateLimitConsumed(token, 0, 0, limit.maxAmount);
-    }
-
     // ============ Relayer Functions ============
 
     /**
-     * @notice Execute a transaction from the Safe (only callable by trusted relayer)
+     * @notice Execute a transaction from a Safe (only callable by trusted relayer)
+     * @param safe Address of the Safe to execute from
      * @param to Destination address
      * @param value ETH value to send
      * @param data Transaction data
      */
     function execute(
+        address safe,
         address to,
         uint256 value,
         bytes calldata data
     ) external onlyTrustedRelayer nonReentrant {
+        // Check target is allowed
+        SafeConfig storage config = s_safeConfigs[safe];
+        if (!config.allTargetsAllowed && !config.allowedTargets[to]) {
+            revert TargetNotAllowed();
+        }
+
         // Check and update rate limits
-        _checkAndUpdateRateLimit(to, value, data);
+        _checkAndUpdateRateLimit(safe, to, value, data);
 
         // Execute transaction from module
-        bool success = ISafe(i_safe).execTransactionFromModule(
+        bool success = ISafe(safe).execTransactionFromModule(
             to,
             value,
             data,
@@ -217,18 +293,19 @@ contract SafePortfolioModule is ReentrancyGuard {
             revert ModuleExecutionFailed();
         }
 
-        emit ExecutionSuccess(to, value, data);
+        emit ExecutionSuccess(safe, to, value, data);
     }
 
     // ============ View Functions ============
 
     /**
-     * @notice Get remaining allowance in current window for a token
+     * @notice Get remaining allowance in current window for a token on a Safe
+     * @param safe Address of the Safe
      * @param token Token address (address(0) for ETH)
      * @return remaining Amount remaining in current window
      */
-    function getRemainingInWindow(address token) external view returns (uint256 remaining) {
-        RateLimit storage limit = s_rateLimits[token];
+    function getRemainingInWindow(address safe, address token) external view returns (uint256 remaining) {
+        RateLimit storage limit = s_safeConfigs[safe].rateLimits[token];
 
         if (limit.maxAmount == 0) {
             return type(uint256).max; // No limit set
@@ -247,7 +324,8 @@ contract SafePortfolioModule is ReentrancyGuard {
     }
 
     /**
-     * @notice Get rate limit info for a token
+     * @notice Get rate limit info for a token on a Safe
+     * @param safe Address of the Safe
      * @param token Token address (address(0) for ETH)
      * @return maxAmount Maximum amount per window
      * @return windowDuration Duration of time window in seconds
@@ -255,14 +333,14 @@ contract SafePortfolioModule is ReentrancyGuard {
      * @return spentInWindow Amount spent in current window
      * @return timeUntilReset Seconds until window resets
      */
-    function getRateLimitInfo(address token) external view returns (
+    function getRateLimitInfo(address safe, address token) external view returns (
         uint256 maxAmount,
         uint256 windowDuration,
         uint256 lastResetTime,
         uint256 spentInWindow,
         uint256 timeUntilReset
     ) {
-        RateLimit storage limit = s_rateLimits[token];
+        RateLimit storage limit = s_safeConfigs[safe].rateLimits[token];
 
         maxAmount = limit.maxAmount;
         windowDuration = limit.windowDuration;
@@ -281,18 +359,20 @@ contract SafePortfolioModule is ReentrancyGuard {
 
     /**
      * @notice Check if the transaction respects rate limits and update spent amounts
+     * @param safe Address of the Safe
      * @param to Destination address
      * @param value ETH value to send
      * @param data Transaction data
      */
     function _checkAndUpdateRateLimit(
+        address safe,
         address to,
         uint256 value,
         bytes calldata data
     ) internal {
         // Handle ETH transfers
         if (value > 0) {
-            _consumeRateLimit(address(0), value);
+            _consumeRateLimit(safe, address(0), value);
         }
 
         // Handle ERC20 transfers
@@ -314,18 +394,19 @@ contract SafePortfolioModule is ReentrancyGuard {
                     (,, amount) = abi.decode(data[4:], (address, address, uint256));
                 }
 
-                _consumeRateLimit(token, amount);
+                _consumeRateLimit(safe, token, amount);
             }
         }
     }
 
     /**
-     * @notice Consume from the rate limit for a token
+     * @notice Consume from the rate limit for a token on a Safe
+     * @param safe Address of the Safe
      * @param token Token address (address(0) for ETH)
      * @param amount Amount to consume
      */
-    function _consumeRateLimit(address token, uint256 amount) internal {
-        RateLimit storage limit = s_rateLimits[token];
+    function _consumeRateLimit(address safe, address token, uint256 amount) internal {
+        RateLimit storage limit = s_safeConfigs[safe].rateLimits[token];
 
         // Skip if no rate limit is set
         if (limit.maxAmount == 0) {
@@ -347,6 +428,7 @@ contract SafePortfolioModule is ReentrancyGuard {
         limit.spentInWindow += amount;
 
         emit RateLimitConsumed(
+            safe,
             token,
             amount,
             limit.spentInWindow,
