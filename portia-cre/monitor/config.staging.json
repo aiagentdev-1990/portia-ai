@@ -1,0 +1,19 @@
+{
+  "schedule": "*/60 * * * * *",
+  "apiUrl": "http://localhost:3000/api/agents/b850bc30-45f8-0041-a00a-83df46d8555d/plugins/starter/api/users/preferences",
+  "agentUrl":"http://localhost:3000/api/agents/b850bc30-45f8-0041-a00a-83df46d8555d/plugins/starter",
+  "evms": [
+    {
+      "storageAddress": "0x91c0eA31b49B69Ea18607702c5d4f6002F85b3f4",
+      "chainName": "ethereum-mainnet"
+    },
+    {
+      "storageAddress": "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e",
+      "chainName": "ethereum-mainnet"
+    },
+    {
+      "storageAddress": "0x1B6E0b25Fef3131f5F461B000cC69d2611Af2D95",
+      "chainName": "ethereum-mainnet"
+    }
+  ]
+}
